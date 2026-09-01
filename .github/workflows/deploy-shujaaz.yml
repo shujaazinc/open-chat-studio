@@ -1,0 +1,390 @@
+# This workflow will build and push a new container image to Amazon ECR,
+# and then will deploy a new task definition for each of the services to Amazon ECS.
+
+# Expected vars:
+# The following vars must be set at the repo level. Their values must be JSON and contain one key per
+# environment (dev, prod, etc.) and the value for each key must be the value for that environment.
+#
+#   DEPLOY_APP_NAME: "app"
+#   DEPLOY_AWS_REGION: "us-west-2"
+#   AWS_ACCOUNT: {"dev": "123456789012", "prod": "123456789012"}
+#   ECR_AWS_ACCOUNT_ID: "123456789012"
+# Note: The names of repository, cluster, services match what is configured in https://github.com/dimagi/ocs-deploy
+
+name: Deploy Shujaaz to Amazon ECS
+
+on:
+  # workflow_dispatch:
+  #   inputs:
+  #     environment:
+  #       description: "Deploy environment"
+  #       required: true
+  #       type: choice
+  #       options:
+  #         - dev
+  #         - prod
+  # workflow_run:
+  #   workflows: [ Lint and Test ]
+  #   types: [completed]
+  #   branches: [main]
+  push:
+    branches:
+      - "setup-deploy"
+
+permissions:
+  id-token: write
+  contents: read
+  deployments: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    # if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+    # Audit only: records egress without blocking. Flip to `block` plus an
+    # `allowed-endpoints` list once the recorded traffic looks stable.
+    - name: Harden the runner
+      uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+      with:
+        egress-policy: audit
+
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        # Nothing here runs git against the remote after checkout, so the token
+        # does not need to sit in .git/config for the rest of the job.
+        persist-credentials: false
+        # git describe needs the tags, which a shallow clone omits.
+        fetch-tags: true
+        fetch-depth: 0
+
+    - name: Resolve OCS version
+      id: ocs-version
+      # Matches `v*` only, so the chat widget's `w_v*` tags cannot win.
+      run: echo "version=$(git describe --tags --match 'v*' --always)" >> "$GITHUB_OUTPUT"
+
+    - name: Set Deploy Env
+      # Set the deploy env based on the input from the event or else from the branch
+      run: |
+        DEPLOY_ENV="dev"
+        echo "DEPLOY_ENV=dev" >> "$GITHUB_ENV"
+
+    - name: Set variables
+      # Set other variables accordingly
+      run: |
+        # you can't reference the `env` context when defining other env vars to do it here
+        APP_NAME="${{ vars.DEPLOY_APP_NAME }}"
+        AWS_REGION="${{ vars.DEPLOY_AWS_REGION }}"
+        {
+          echo "APP_NAME=$APP_NAME"
+          echo "AWS_REGION=$AWS_REGION"
+          echo "ECR_REPOSITORY=open-chat-studio"
+          echo "ECS_CLUSTER=$APP_NAME-${{ env.DEPLOY_ENV }}-Cluster"
+          echo "ECS_SERVICE_DJANGO=$APP_NAME-${{ env.DEPLOY_ENV }}-Django"
+          echo "ECS_SERVICE_CELERY=$APP_NAME-${{ env.DEPLOY_ENV }}-Celery"
+          echo "ECS_SERVICE_CELERY_BACKGROUND=$APP_NAME-${{ env.DEPLOY_ENV }}-CeleryBackground"
+          echo "ECS_SERVICE_CELERY_EVALUATIONS=$APP_NAME-${{ env.DEPLOY_ENV }}-CeleryEvaluations"
+          echo "ECS_SERVICE_CELERY_BEAT=$APP_NAME-${{ env.DEPLOY_ENV }}-CeleryBeat"
+          echo "DJANGO_STACK_NAME=$APP_NAME-${{ env.DEPLOY_ENV }}-$AWS_REGION-django-stack"
+        } >> "$GITHUB_ENV"
+
+    - name: Create GitHub deployment
+      uses: chrnorm/deployment-action@v2
+      id: deployment
+      with:
+        token: '${{ github.token }}'
+        environment: "aws-${{ env.DEPLOY_ENV }}"
+        production-environment: ${{ env.DEPLOY_ENV == 'prod' }}
+        description: "Deploying ${{ github.head_ref || github.ref }} to AWS ${{ env.DEPLOY_ENV }}"
+
+    - name: Configure aws credentials - shared services account
+      uses: aws-actions/configure-aws-credentials@v6.2.4
+      with:
+        role-to-assume: "arn:aws:iam::${{ vars.ECR_AWS_ACCOUNT_ID }}:role/github_deploy"
+        role-session-name: GitHub_to_AWS_via_FederatedOIDC
+        aws-region: ${{ vars.DEPLOY_AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2.1.7
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+
+    - name: Get image names
+      id: image-name
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      run: |
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+        echo "image_latest=$ECR_REGISTRY/$ECR_REPOSITORY:latest" >> "$GITHUB_OUTPUT"
+
+    - name: Build and push
+      if: steps.check-image.outputs.exists != 'true'
+      uses: docker/build-push-action@v7
+      with:
+        tags: |
+          ${{ steps.image-name.outputs.image }}
+          ${{ steps.image-name.outputs.image_latest }}
+        file: Dockerfile
+        build-args: |
+          OCS_VERSION=${{ steps.ocs-version.outputs.version }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        sbom: false
+        provenance: false
+        outputs: type=image,push=true,oci-mediatypes=true,compression=zstd,compression-level=3
+
+    - name: Clear Existing AWS Env Vars
+      # unset-current-credentials: true below does not work
+      run: |
+        echo "AWS_ACCESS_KEY_ID=" >> $GITHUB_ENV
+        echo "AWS_SECRET_ACCESS_KEY=" >> $GITHUB_ENV
+        echo "AWS_SESSION_TOKEN=" >> $GITHUB_ENV
+
+    - name: Configure aws credentials - workload environment account
+      uses: aws-actions/configure-aws-credentials@v6.2.3
+      with:
+        role-to-assume: "arn:aws:iam::${{ fromJSON(vars.AWS_ACCOUNT)[env.DEPLOY_ENV] }}:role/github_deploy"
+        role-session-name: GitHub_to_AWS_via_FederatedOIDC
+        aws-region: ${{ vars.DEPLOY_AWS_REGION }}
+        # unset-current-credentials: true
+
+    - name: Update ECS task def for Django web container
+      id: django-web-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1.9.0
+      with:
+        task-definition-family: ${{ env.APP_NAME }}-${{ env.DEPLOY_ENV }}-Django
+        container-name: web
+        image: ${{ steps.image-name.outputs.image }}
+
+    - name: Update ECS task def for Migration container
+      id: migration-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1.9.0
+      with:
+        task-definition-family: ${{ env.APP_NAME }}-${{ env.DEPLOY_ENV }}-Migration
+        container-name: migrate
+        image: ${{ steps.image-name.outputs.image }}
+
+    - name: Update ECS task def for Celery worker container
+      id: celery-worker-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1.9.0
+      with:
+        task-definition-family: ${{ env.APP_NAME }}-${{ env.DEPLOY_ENV }}-CeleryWorkerTask
+        container-name: celery-worker
+        image: ${{ steps.image-name.outputs.image }}
+
+    - name: Update ECS task def for Celery background worker container
+      id: celery-background-worker-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1.9.0
+      with:
+        task-definition-family: ${{ env.APP_NAME }}-${{ env.DEPLOY_ENV }}-CeleryBackgroundWorkerTask
+        container-name: celery-background-worker
+        image: ${{ steps.image-name.outputs.image }}
+
+    - name: Update ECS task def for Celery evaluations worker container
+      id: celery-evaluations-worker-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1.9.0
+      with:
+        task-definition-family: ${{ env.APP_NAME }}-${{ env.DEPLOY_ENV }}-CeleryEvaluationsWorkerTask
+        container-name: celery-evaluations-worker
+        image: ${{ steps.image-name.outputs.image }}
+
+    - name: Update ECS task def for Celery beat container
+      id: celery-beat-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1.9.0
+      with:
+        task-definition-family: ${{ env.APP_NAME }}-${{ env.DEPLOY_ENV }}-CeleryBeatTask
+        container-name: celery-beat
+        image: ${{ steps.image-name.outputs.image }}
+
+    - name: Get stack outputs for network config
+      id: stack-outputs
+      run: |
+        set -e
+        OUTPUTS=$(aws cloudformation describe-stacks \
+          --stack-name "$DJANGO_STACK_NAME" \
+          --query 'Stacks[0].Outputs' \
+          --output json) || { echo "Failed to retrieve CloudFormation stack outputs"; exit 1; }
+
+        SUBNETS=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey | endswith("PrivateSubnets")) | .OutputValue')
+        SG=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey | endswith("ServiceSecurityGroup")) | .OutputValue')
+
+        [[ -z "$SUBNETS" ]] && { echo "Error: Could not find subnets in stack outputs"; exit 1; }
+        [[ -z "$SG" ]] && { echo "Error: Could not find security group in stack outputs"; exit 1; }
+
+        echo "subnets=$SUBNETS" >> "$GITHUB_OUTPUT"
+        echo "security_group=$SG" >> "$GITHUB_OUTPUT"
+
+    - name: Run migration task
+      id: run-migration
+      run: |
+        # Strip metadata fields that cause issues when re-registering
+        jq 'del(.tags, .registeredAt, .registeredBy, .taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities)' \
+          ${{ steps.migration-def.outputs.task-definition }} > /tmp/migration-task-def.json
+
+        # Register task definition with new image
+        TASK_DEF_ARN=$(aws ecs register-task-definition \
+          --cli-input-json file:///tmp/migration-task-def.json \
+          --query 'taskDefinition.taskDefinitionArn' \
+          --output text)
+
+        # Run the migration task
+        TASK_ARN=$(aws ecs run-task \
+          --cluster "$ECS_CLUSTER" \
+          --task-definition "$TASK_DEF_ARN" \
+          --launch-type FARGATE \
+          --network-configuration "awsvpcConfiguration={subnets=[${{ steps.stack-outputs.outputs.subnets }}],securityGroups=[${{ steps.stack-outputs.outputs.security_group }}],assignPublicIp=DISABLED}" \
+          --query 'tasks[0].taskArn' \
+          --output text)
+
+        echo "task_arn=$TASK_ARN" >> "$GITHUB_OUTPUT"
+        echo "Started migration task: $TASK_ARN"
+
+    - name: Wait for migration & output logs
+      run: |
+        echo "Waiting for migration task to complete..."
+        aws ecs wait tasks-stopped \
+          --cluster "$ECS_CLUSTER" \
+          --tasks "${{ steps.run-migration.outputs.task_arn }}"
+
+        # Check exit code
+        EXIT_CODE=$(aws ecs describe-tasks \
+          --cluster "$ECS_CLUSTER" \
+          --tasks "${{ steps.run-migration.outputs.task_arn }}" \
+          --query 'tasks[0].containers[0].exitCode' \
+          --output text)
+
+        # Get task details for log configuration
+        TASK_ID=$(echo "${{ steps.run-migration.outputs.task_arn }}" | cut -d'/' -f3)
+
+        # Output migration logs
+        LOG_STREAM="${LOG_STREAM_PREFIX}/${TASK_ID}"
+        echo "Fetching migration logs from CloudWatch..."
+
+        LOGS=$(aws logs get-log-events \
+          --log-group-name "$LOG_GROUP" \
+          --log-stream-name "$LOG_STREAM" \
+          --limit 100 \
+          --query 'events[*].message' \
+          --output json 2>&1) || LOGS="Could not fetch logs"
+
+        # Output to console
+        echo "----------------------------------------"
+        echo "$LOGS"
+        echo "----------------------------------------"
+
+        # Add to job summary
+        {
+          echo "## Migration Logs"
+          echo ""
+          echo "**Task ID:** \`$TASK_ID\`"
+          echo "**Log Group:** \`$LOG_GROUP\`"
+          echo "**Log Stream:** \`$LOG_STREAM\`"
+          echo ""
+          echo "<details>"
+          echo "<summary>View Logs</summary>"
+          echo ""
+          echo "\`\`\`json"
+          echo "$LOGS"
+          echo "\`\`\`"
+          echo "</details>"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$EXIT_CODE" != "0" ]; then
+          echo "Migration failed with exit code: $EXIT_CODE"
+          {
+            echo ""
+            echo "❌ **Migration failed with exit code: $EXIT_CODE**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        fi
+
+        echo "Migration completed successfully"
+        {
+          echo ""
+          echo "✅ **Migration completed successfully**"
+        } >> "$GITHUB_STEP_SUMMARY"
+      env:
+        LOG_GROUP: ${{ env.APP_NAME }}-${{ env.DEPLOY_ENV }}-DjangoMigrationLogs
+        LOG_STREAM_PREFIX: ${{ env.APP_NAME }}-${{ env.DEPLOY_ENV }}-migrate/migrate
+
+    - name: Deploy Django Web
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.django-web-def.outputs.task-definition }}
+        service: ${{ env.ECS_SERVICE_DJANGO }}
+        cluster: ${{ env.ECS_CLUSTER }}
+        wait-for-service-stability: false
+
+    - name: Deploy Celery Worker
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.celery-worker-def.outputs.task-definition }}
+        service: ${{ env.ECS_SERVICE_CELERY }}
+        cluster: ${{ env.ECS_CLUSTER }}
+        wait-for-service-stability: false
+
+    - name: Deploy Celery Background Worker
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.celery-background-worker-def.outputs.task-definition }}
+        service: ${{ env.ECS_SERVICE_CELERY_BACKGROUND }}
+        cluster: ${{ env.ECS_CLUSTER }}
+        wait-for-service-stability: false
+
+    - name: Deploy Celery Evaluations Worker
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.celery-evaluations-worker-def.outputs.task-definition }}
+        service: ${{ env.ECS_SERVICE_CELERY_EVALUATIONS }}
+        cluster: ${{ env.ECS_CLUSTER }}
+        wait-for-service-stability: false
+
+    - name: Deploy Celery Beat
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.celery-beat-def.outputs.task-definition }}
+        service: ${{ env.ECS_SERVICE_CELERY_BEAT }}
+        cluster: ${{ env.ECS_CLUSTER }}
+        wait-for-service-stability: false
+
+    - name: Wait for service stability
+      run: |
+          # Run the waiters in parallel. `set -e` (default in GH Actions bash)
+          # doesn't apply to background processes, so we capture each exit code via
+          # `wait <pid>` and fail only after all of them have finished.
+          services=(
+            "$ECS_SERVICE_DJANGO"
+            "$ECS_SERVICE_CELERY"
+            "$ECS_SERVICE_CELERY_BACKGROUND"
+            "$ECS_SERVICE_CELERY_EVALUATIONS"
+            "$ECS_SERVICE_CELERY_BEAT"
+          )
+
+          pids=()
+          for service in "${services[@]}"; do
+            aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$service" &
+            pids+=($!)
+          done
+
+          rc=0
+          for i in "${!services[@]}"; do
+            wait "${pids[$i]}" || { echo "${services[$i]} failed to stabilise"; rc=1; }
+          done
+          exit $rc
+
+    - name: Update deployment status
+      if: always()
+      uses: chrnorm/deployment-status@v2
+      with:
+        token: '${{ github.token }}'
+        environment-url: ${{ steps.deployment.outputs.environment_url }}
+        deployment-id: ${{ steps.deployment.outputs.deployment_id }}
+        state: ${{ job.status == 'success' && 'success' || 'failure' }}
