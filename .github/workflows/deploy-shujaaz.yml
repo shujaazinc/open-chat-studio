@@ -322,6 +322,8 @@ jobs:
         service: ${{ env.ECS_SERVICE_DJANGO }}
         cluster: ${{ env.ECS_CLUSTER }}
         wait-for-service-stability: false
+        service-managed-ebs-volume-name: "sync-state"
+        service-managed-ebs-volume: '{"sizeInGiB": 1, "volumeType": "gp3", "encrypted": true, "roleArn":"arn:aws:iam::${{ fromJSON(vars.AWS_ACCOUNT)[env.DEPLOY_ENV] }}:role/${{ env.APP_NAME }}-${{ env.DEPLOY_ENV }}-ecs-task-execution-role "}'
 
     - name: Deploy Celery Worker
       uses: aws-actions/amazon-ecs-deploy-task-definition@v2
