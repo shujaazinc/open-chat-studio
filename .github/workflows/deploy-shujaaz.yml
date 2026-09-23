@@ -30,6 +30,9 @@ on:
   # push:
   #   branches:
   #     - main
+  push:
+    tags:
+      - prod-*
 
 permissions:
   id-token: write
