@@ -77,7 +77,7 @@ jobs:
       run: |
         if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
           DEPLOY_ENV="${{ inputs.environment }}"
-        elif [[ "${{github.ref}}" == "refs/tags/*" ]]; then
+        elif [[ "${{github.ref}}" == refs/tags/* ]]; then
           DEPLOY_ENV="prod"
         elif [[ "${{github.ref}}" == "refs/heads/main" ]]; then
           DEPLOY_ENV="dev"
