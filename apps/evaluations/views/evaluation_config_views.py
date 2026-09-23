@@ -8,13 +8,12 @@ from functools import cached_property
 from io import StringIO
 from typing import Any
 
-from celery.result import AsyncResult
-from celery_progress.backend import Progress
 from django.conf import settings
+from django.contrib import messages
 from django.contrib.auth.decorators import permission_required
 from django.contrib.auth.mixins import PermissionRequiredMixin
 from django.db import transaction
-from django.http import Http404, HttpResponse, HttpResponseRedirect, JsonResponse
+from django.http import Http404, HttpRequest, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import get_object_or_404, render
 from django.template.response import TemplateResponse
 from django.urls import reverse
@@ -34,7 +33,7 @@ from apps.cost_tracking.services.reporting import (
 )
 from apps.evaluations.breadcrumbs import config_runs_label, evaluations_crumbs, run_label
 from apps.evaluations.const import EVALUATION_RUN_FIXED_HEADERS
-from apps.evaluations.exceptions import InFlightRunsError
+from apps.evaluations.exceptions import InFlightRunsError, NoActiveEvaluatorsError
 from apps.evaluations.export import (
     CategoricalColumn,
     categorical_columns_for_evaluators,
@@ -861,17 +860,31 @@ class EvaluationResultDetailView(EvaluationResultDataMixin, PermissionRequiredMi
         return render(request, "evaluations/components/evaluation_result_detail_panel.html", context)
 
 
+def _refused_run_response(request: HttpRequest, config: EvaluationConfig, error: NoActiveEvaluatorsError):
+    """Redirect to the config's runs home carrying the refusal as an error message."""
+    messages.error(request, ", ".join(error.messages))
+    return HttpResponseRedirect(reverse("evaluations:evaluation_runs_home", args=[request.team.slug, config.pk]))
+
+
 @permission_required("evaluations.add_evaluationrun")
 def create_evaluation_run(request, team_slug, evaluation_pk):
+    """Start a full run of the config; a config with no active evaluators is refused with a message."""
     config = get_object_or_404(EvaluationConfig, team=request.team, pk=evaluation_pk)
-    run = config.run()
+    try:
+        run = config.run()
+    except NoActiveEvaluatorsError as e:
+        return _refused_run_response(request, config, e)
     return HttpResponseRedirect(reverse("evaluations:evaluation_results_home", args=[team_slug, evaluation_pk, run.pk]))
 
 
 @permission_required("evaluations.add_evaluationrun")
 def create_evaluation_preview(request, team_slug, evaluation_pk):
+    """Start a preview run of the config; a config with no active evaluators is refused with a message."""
     config = get_object_or_404(EvaluationConfig, team=request.team, pk=evaluation_pk)
-    run = config.run_preview()
+    try:
+        run = config.run_preview()
+    except NoActiveEvaluatorsError as e:
+        return _refused_run_response(request, config, e)
     return HttpResponseRedirect(reverse("evaluations:evaluation_results_home", args=[team_slug, evaluation_pk, run.pk]))
 
 
@@ -925,6 +938,7 @@ def load_experiment_versions(request, team_slug: str):
 
 @login_and_team_required
 @permission_required("evaluations.change_evaluationrun")
+@require_http_methods(["GET", "POST"])
 def update_evaluation_run_results(request, team_slug: str, evaluation_pk: int, evaluation_run_pk: int):
     """Upload CSV to update evaluation run results"""
     evaluation_run = get_object_or_404(EvaluationRun, id=evaluation_run_pk, config_id=evaluation_pk, team=request.team)
@@ -940,7 +954,7 @@ def update_evaluation_run_results(request, team_slug: str, evaluation_pk: int, e
             ],
         }
         return render(request, "evaluations/evaluation_run_update.html", context)
-    elif request.method == "POST":
+    else:
         try:
             payload = json.loads(request.body)
             csv_data = payload.get("csv_data", [])
@@ -951,7 +965,7 @@ def update_evaluation_run_results(request, team_slug: str, evaluation_pk: int, e
             )
             return JsonResponse({"success": True, "task_id": task.id})
         except Exception as e:
-            logger.error(f"Error starting CSV upload for evaluation run {evaluation_run.id}: {str(e)}")
+            logger.error(f"Error starting CSV upload for evaluation run {evaluation_run.id}: {e!s}")
             return JsonResponse({"error": "An error occurred while starting the CSV upload"}, status=500)
 
 
@@ -1024,29 +1038,4 @@ def start_bulk_download(request, team_slug: str, evaluation_pk: int):
         request,
         "evaluations/partials/bulk_download.html",
         {"config": config, "task_id": task.id},
-    )
-
-
-@login_and_team_required
-@permission_required("evaluations.view_evaluationrun")
-def get_bulk_download_link(request, team_slug: str, evaluation_pk: int, task_id: str):
-    """Poll the bulk export task and return a download link when ready."""
-    config = get_object_or_404(EvaluationConfig, id=evaluation_pk, team=request.team)
-    info = Progress(AsyncResult(task_id)).get_info()
-    context: dict = {"config": config}
-    if info["complete"] and info["success"]:
-        file_id = info["result"].get("file_id")
-        if file_id:
-            download_url = reverse("files:base", kwargs={"team_slug": team_slug, "pk": file_id}) + "?allow_s3=1"
-            context["export_download_url"] = download_url
-        else:
-            context["export_error"] = info["result"].get("error", "Export failed.")
-    elif info["complete"]:
-        context["export_error"] = "Export failed."
-    else:
-        context["task_id"] = task_id
-    return TemplateResponse(
-        request,
-        "evaluations/partials/bulk_download.html",
-        context,
     )

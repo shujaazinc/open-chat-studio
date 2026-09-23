@@ -78,11 +78,6 @@ urlpatterns = [
         name="evaluation_bulk_download_start",
     ),
     path(
-        "<int:evaluation_pk>/bulk_download/<str:task_id>/",
-        evaluation_config_views.get_bulk_download_link,
-        name="evaluation_bulk_download_link",
-    ),
-    path(
         "sessions_selection_table",
         dataset_views.DatasetSessionsSelectionTableView.as_view(),
         name="dataset_sessions_selection_list",
@@ -187,3 +182,11 @@ urlpatterns = [
 urlpatterns.extend(make_crud_urls(evaluation_config_views, "Evaluation", delete=True))
 urlpatterns.extend(make_crud_urls(evaluator_views, "Evaluator", prefix="evaluator"))
 urlpatterns.extend(make_crud_urls(dataset_views, "Dataset", prefix="dataset"))
+
+urlpatterns.append(
+    path(
+        "evaluator/<int:pk>/unarchive/",
+        evaluator_views.UnarchiveEvaluator.as_view(),
+        name="evaluator_unarchive",
+    )
+)
