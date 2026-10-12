@@ -68,11 +68,13 @@ class EvaluationConfigTable(tables.Table):
 
     def render_evaluators(self, value, record):
         """Render the evaluators column with icons and labels in an unordered list."""
-        if not value.exists():
+        # Use list() so the prefetch cache is consumed rather than issuing a new EXISTS query.
+        evaluators = list(value.all())
+        if not evaluators:
             return "—"
 
         rows = []
-        for evaluator in value.all():
+        for evaluator in evaluators:
             type_info = get_evaluator_type_display(evaluator.type)
             icon_class = type_info.get("icon") or ""
             label = type_info.get("label") or ""
@@ -94,6 +96,10 @@ class EvaluationConfigTable(tables.Table):
             ),
         )
         return format_html('<ul class="list-disc list-inside">{}</ul>', items)
+
+    def render_dataset(self, record):
+        """Render just the dataset name to avoid EvaluationDataset.__str__ calling messages.count()."""
+        return record.dataset.name
 
     def render_generation_chatbot(self, record):
         if not record.base_experiment:
@@ -158,18 +164,15 @@ class EvaluationRunTable(tables.Table):
 
     cost = columns.Column(verbose_name="Cost", orderable=False, empty_values=())
 
-    actions = actions.ActionsColumn(
-        actions=[
-            actions.Action(
-                url_name="evaluations:evaluation_run_download",
-                url_factory=lambda url_name, request, record, _: reverse(
-                    url_name, args=[request.team.slug, record.config_id, record.id]
-                ),
-                icon_class="fa-solid fa-download",
-                title="Download CSV",
-                enabled_condition=lambda _, record: record.status == "completed",
-            ),
-        ]
+    actions = TemplateColumn(
+        template_code=(
+            '{% url "evaluations:evaluation_run_download_start" request.team.slug record.config_id record.id'
+            " as run_export_url %}"
+            '{% include "evaluations/partials/export_button.html" with export_id=record.id'
+            ' start_url=run_export_url button_class="btn-sm" disabled=record.is_running only %}'
+        ),
+        verbose_name="",
+        orderable=False,
     )
 
     def render_cost(self, record):
